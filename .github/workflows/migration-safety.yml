@@ -2,13 +2,20 @@ name: Migration Safety
 
 # Detects DB migrations that could cause a production CPU/memory/I/O/lock spike.
 # Only inspects `.db/*.sql` files ADDED or MODIFIED by the PR. Analyzer is pure
-# awk (preinstalled on ubuntu-latest) — no Python, no pip, no runtime install.
-# HIGH risk => fails the required `migration-safety` check, requests a DevOps
-# review, and posts an explanatory PR comment. No production database access.
+# awk (preinstalled on ubuntu-latest). No Python, no pip, no runtime install.
+# HIGH risk => fails this check, requests the author's team for review, and
+# posts an explanatory PR comment. No production database access.
+#
+# `paths` limits the trigger to PRs that actually touch `.db/`, so no migration
+# PR = this workflow never runs. Because a skipped job cannot report a required
+# status, this check is NOT in the master ruleset's required-checks list; it is
+# advisory (blocks nothing on its own) unless re-added to required.
 on:
   pull_request:
     branches:
       - master
+    paths:
+      - '.db/**'
     types:
       - opened
       - synchronize
