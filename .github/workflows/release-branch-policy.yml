@@ -46,6 +46,7 @@ jobs:
         if: steps.validate.outputs.ok == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # gh needs repo context (no checkout in this job)
           PR: ${{ github.event.pull_request.number }}
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
