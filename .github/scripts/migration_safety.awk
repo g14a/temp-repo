@@ -1,4 +1,4 @@
-# Database migration resource-spike analyzer (PostgreSQL) — pure awk, no deps.
+# Database migration resource-spike analyzer (PostgreSQL). Pure awk, no deps.
 #
 # Static analysis of migration SQL. Flags operations that could cause a
 # significant production DB CPU / memory / I/O / workload / lock spike because
@@ -11,7 +11,7 @@
 # to the file named by env RISK_FILE, if set.
 #
 # Portable: uses only POSIX awk features (no gensub/asort). Comment/string
-# handling is conservative static analysis — documented limitation.
+# handling is conservative static analysis (documented limitation).
 
 function rank(r) { if (r=="HIGH") return 2; if (r=="MEDIUM") return 1; return 0 }
 
@@ -102,15 +102,15 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         # migration file (handled above) is exempt.
         if (U ~ /CONCURRENTLY/) {
             add("HIGH", "CREATE INDEX CONCURRENTLY ON " tbl,
-                "Concurrent index build on an existing table — lighter locking than a plain build, but still a long, resource-intensive full scan. Policy flags all indexes on existing tables.",
-                "High CPU; High memory; High disk I/O; query latency during build",
-                "Requires DevOps review. Run in a low-traffic window and monitor I/O; confirm the table size justifies it.")
+                "Index build on an existing table (full scan). Policy blocks all indexes on existing tables.",
+                "High CPU, memory, I/O; query latency during build",
+                "DevOps review. Run off-peak, monitor I/O.")
             return
         }
         add("HIGH", "CREATE INDEX ON " tbl,
-            "Index creation on an existing table takes an ACCESS EXCLUSIVE lock and scans every row.",
-            "High CPU; High memory; High disk I/O; blocks writes to the table",
-            "Use CREATE INDEX CONCURRENTLY (outside a transaction) to reduce locking; still requires DevOps review.")
+            "Index build on an existing table takes an ACCESS EXCLUSIVE lock and scans every row.",
+            "High CPU, memory, I/O; blocks writes",
+            "Use CREATE INDEX CONCURRENTLY. DevOps review.")
         return
     }
 
@@ -129,23 +129,23 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         if (is_new_table(tbl)) return   # altering fresh empty table -> LOW
         if (U ~ /ALTER (COLUMN )?[A-Z0-9_"]+ (SET DATA )?TYPE /) {
             add("HIGH", "ALTER TABLE " tbl " ALTER COLUMN ... TYPE",
-                "Column type change can force a full table rewrite of existing rows under an exclusive lock.",
-                "High CPU; High disk I/O; large WAL/redo; exclusive lock; app latency",
-                "Add a new column, backfill in batches, then swap — avoid an in-place rewrite.")
+                "Type change can rewrite the whole table under an exclusive lock.",
+                "High CPU, I/O; large WAL; exclusive lock",
+                "Add new column, backfill in batches, then swap.")
             return
         }
         if (U ~ /SET NOT NULL/) {
             add("MEDIUM", "ALTER TABLE " tbl " SET NOT NULL",
-                "Adding NOT NULL scans the whole table to validate existing rows.",
-                "Full table scan; exclusive lock during validation",
-                "Add CHECK (col IS NOT NULL) NOT VALID, VALIDATE CONSTRAINT, then SET NOT NULL (PG12+).")
+                "NOT NULL scans the whole table to validate rows.",
+                "Full table scan; exclusive lock",
+                "CHECK (col IS NOT NULL) NOT VALID, VALIDATE, then SET NOT NULL (PG12+).")
             return
         }
         if (U ~ /ADD COLUMN/ && U ~ /DEFAULT /  && U ~ /(NOW\(|CURRENT_TIMESTAMP|RANDOM\(|GEN_RANDOM_UUID|UUID_GENERATE|CLOCK_TIMESTAMP|NEXTVAL)/) {
             add("MEDIUM", "ALTER TABLE " tbl " ADD COLUMN ... DEFAULT <volatile>",
-                "A non-constant column default is evaluated per existing row, rewriting the table.",
-                "High CPU; High disk I/O; large WAL/redo",
-                "Add the column without a default, backfill in batches, then set the default.")
+                "Non-constant DEFAULT is evaluated per row, rewriting the table.",
+                "High CPU, I/O; large WAL",
+                "Add column without default, backfill in batches, then set default.")
             return
         }
         # ADD/DROP COLUMN, SET DEFAULT, RENAME, etc. -> LOW
@@ -161,23 +161,23 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         agg = (setc ~ /SELECT / || setc ~ /(SUM|COUNT|AVG|MAX|MIN|JOIN)/)
         if (wh == "") {
             add("HIGH", "UPDATE " tbl,
-                "Full-table UPDATE — no WHERE clause, every existing row is modified.",
-                "High CPU; High disk I/O; large WAL/redo; increased DB latency",
-                "Backfill incrementally in batches keyed by primary key.")
+                "Full-table UPDATE, no WHERE; every row modified.",
+                "High CPU, I/O; large WAL; DB latency",
+                "Backfill in batches keyed by primary key.")
             return
         }
         if (single_row(wh)) return
         if (agg) {
             add("HIGH", "UPDATE " tbl " (computed)",
-                "UPDATE with an expensive subquery/aggregation in SET over an existing table.",
-                "High CPU; High disk I/O; large WAL/redo; high memory for sort/aggregate",
-                "Precompute into a staging table, then batch-apply keyed by primary key.")
+                "UPDATE with a subquery/aggregation in SET over an existing table.",
+                "High CPU, I/O; large WAL; memory for sort",
+                "Precompute into a staging table, batch-apply by primary key.")
             return
         }
         add("MEDIUM", "UPDATE " tbl,
-            "Broad UPDATE — predicate may match a large share of the table.",
-            "High CPU; High disk I/O; large WAL/redo",
-            "Confirm affected-row estimate; batch by primary key if large.")
+            "Broad UPDATE; predicate may match a large share of the table.",
+            "High CPU, I/O; large WAL",
+            "Confirm row estimate; batch by primary key if large.")
         return
     }
 
@@ -188,16 +188,16 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         wh = where_clause(U)
         if (wh == "") {
             add("HIGH", "DELETE FROM " tbl,
-                "Full-table DELETE — no WHERE clause, deletes every row (large scan + WAL).",
-                "High CPU; High disk I/O; large WAL/redo; increased DB latency",
-                "If clearing the table use TRUNCATE; otherwise delete in batches.")
+                "Full-table DELETE, no WHERE; every row deleted.",
+                "High CPU, I/O; large WAL; DB latency",
+                "Use TRUNCATE to clear, else delete in batches.")
             return
         }
         if (single_row(wh)) return
         add("MEDIUM", "DELETE FROM " tbl,
-            "Range DELETE — predicate may remove a large number of rows.",
-            "High CPU; High disk I/O; large WAL/redo",
-            "Delete in bounded batches (WHERE ... LIMIT N) to cap WAL/lock time.")
+            "Range DELETE; may remove many rows.",
+            "High CPU, I/O; large WAL",
+            "Delete in bounded batches (WHERE ... LIMIT N).")
         return
     }
 
@@ -211,9 +211,9 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         if (!existing) return              # SELECT from fresh/empty tables -> LOW
         agg = (U ~ /(GROUP BY|ORDER BY|DISTINCT|JOIN| SUM\(| COUNT\(| AVG\()/)
         add("HIGH", "INSERT INTO " tbl " SELECT ...",
-            "INSERT ... SELECT reading existing table(s)" (agg ? " with aggregation/sort/join" : "") " — large scan and write volume.",
-            "High CPU; High disk I/O; large WAL/redo" (agg ? "; high memory for sort/aggregate" : ""),
-            "Populate the target in batches, or transform offline and load incrementally.")
+            "INSERT ... SELECT reads existing table(s)" (agg ? " with aggregation/sort/join" : "") "; large scan and write.",
+            "High CPU, I/O; large WAL" (agg ? "; memory for sort" : ""),
+            "Populate in batches, or transform offline and load incrementally.")
         return
     }
     # everything else -> LOW
@@ -249,30 +249,19 @@ function from_tables(U, arr,   tmp, n, i, parts, k, m) {
 END {
     if (CURFILE != "") flush_file()
 
-    # ---- render report ----
+    # ---- render report (compact, one line per finding) ----
     print "## Database Migration Safety"
-    print ""
     if (OVERALL == "" || OVERALL == "LOW") {
-        print "✅ **PASS** — no migration appears to risk a production resource spike."
+        print "✅ PASS. No migration risks a production resource spike."
     } else if (OVERALL == "HIGH") {
-        print "❌ **HIGH RISK migration detected** — this PR is blocked."
-        print ""
+        print "❌ HIGH risk. This PR is blocked."
     } else {
-        print "⚠️ **WARNING** — review recommended (does not block)."
-        print ""
+        print "⚠️ WARNING. Review recommended (not blocking)."
     }
+    print ""
     for (k = 1; k <= N; k++) {
         emoji = (F_RISK[k]=="HIGH" ? "❌" : (F_RISK[k]=="MEDIUM" ? "⚠️" : "✅"))
-        print "### " emoji " " F_RISK[k] " — `" F_FILE[k] "`"
-        print ""
-        print "**Operation:** `" F_OP[k] "`"
-        print ""
-        print "**Risk:** " F_REASON[k]
-        print ""
-        print "**Potential impact:** " F_IMPACT[k]
-        print ""
-        print "**Recommendation:** " F_REC[k]
-        print ""
+        print "- " emoji " " F_RISK[k] " `" F_FILE[k] "`: `" F_OP[k] "`. " F_REASON[k] " Impact: " F_IMPACT[k] ". Fix: " F_REC[k]
     }
     lvl = (OVERALL == "" ? "LOW" : OVERALL)
     if (ENVIRON["RISK_FILE"] != "") print lvl > ENVIRON["RISK_FILE"]
