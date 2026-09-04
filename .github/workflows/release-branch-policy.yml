@@ -11,6 +11,10 @@ on:
       - synchronize
       - reopened
 
+permissions:
+  contents: read
+  pull-requests: write   # post the guidance comment on failure
+
 concurrency:
   group: release-branch-policy-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -21,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate source branch is a release branch
+        id: validate
         env:
           # Bind the untrusted branch name to an env var; never interpolate a
           # branch name straight into the shell script body.
@@ -28,12 +33,47 @@ jobs:
         run: |
           set -euo pipefail
           echo "Source branch: $HEAD_BRANCH"
-
           if [[ "$HEAD_BRANCH" == release/* || "$HEAD_BRANCH" == release-* ]]; then
             echo "✅ Release branch — allowed to target master."
-            exit 0
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Comment once (deduped by a hidden marker) when the source is not a
+      # release branch, telling the author what to do instead.
+      - name: Comment guidance on invalid source
+        if: steps.validate.outputs.ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          MARKER="<!-- release-branch-policy -->"
+          # Skip if we already left this comment on the PR.
+          if gh pr view "$PR" --json comments -q '.comments[].body' | grep -qF "$MARKER"; then
+            echo "Guidance comment already present; skipping."
+            exit 0
+          fi
+          {
+            echo "$MARKER"
+            echo "🚫 **This PR cannot merge into \`master\`.**"
+            echo ""
+            echo "Only release branches (\`release/*\` or \`release-*\`) may target \`master\`."
+            echo "The source branch \`$HEAD_BRANCH\` is not one."
+            echo ""
+            echo "**Please create this PR against a release branch instead of \`master\`.**"
+            echo "Merge your work into a \`release/*\` branch, and let that release branch be"
+            echo "the one that opens a PR to \`master\`."
+          } > policy_comment.md
+          gh pr comment "$PR" --body-file policy_comment.md
+
+      - name: Enforce policy
+        if: steps.validate.outputs.ok == 'false'
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
           echo "❌ PRs to master must originate from a release/* or release-* branch."
           echo "   Source '$HEAD_BRANCH' is not a release branch."
           exit 1
