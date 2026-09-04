@@ -22,10 +22,6 @@ concurrency:
   group: migration-safety-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-env:
-  # GitHub team (slug only, no org prefix) asked to review on HIGH risk.
-  DEVOPS_TEAM: devops
-
 jobs:
   migration-safety:
     name: migration-safety
@@ -86,37 +82,83 @@ jobs:
         if: steps.guard.outputs.run == 'true' && steps.changed.outputs.any != 'true'
         run: echo "✅ No .db/*.sql migrations changed by this PR." >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- HIGH-risk escalation: comment FIRST, then request review ----
+      # ---- HIGH-risk escalation: request review from the author's own team(s) ----
+      # The PR author belongs to one or more GitHub teams in the org. We find
+      # those teams and request review from them (which notifies the other
+      # members; the author cannot review their own PR). Individual teammates are
+      # named in the comment for visibility.
+      #
+      # NOTE: reading org teams/membership needs a token with `read:org` and
+      # `members` access. The default GITHUB_TOKEN usually cannot list org teams;
+      # provide a PAT/app token as `GH_TOKEN` (secret) for this to work. Requires
+      # an organization repo — personal repos have no teams.
+      - name: Request review from author's team on HIGH risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
+        continue-on-error: true   # a review-request failure must not skip the fail step
+        env:
+          GH_TOKEN: ${{ secrets.ORG_REVIEW_TOKEN || github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -uo pipefail
+          ORG="${GITHUB_REPOSITORY%%/*}"
+          : > teams.txt; : > reviewers.txt
+
+          # Teams in the org that the PR author is a member of.
+          for slug in $(gh api --paginate "orgs/${ORG}/teams" -q '.[].slug' 2>/dev/null); do
+            if gh api "orgs/${ORG}/teams/${slug}/memberships/${AUTHOR}" >/dev/null 2>&1; then
+              echo "$slug" >> teams.txt
+            fi
+          done
+
+          if [[ ! -s teams.txt ]]; then
+            echo "::warning::No org team found for author '${AUTHOR}' (needs an org repo + read:org token). Check still fails."
+            exit 0
+          fi
+
+          echo "Author '${AUTHOR}' teams:"; cat teams.txt
+          # Other members of those teams (union, minus the author) for the comment.
+          while IFS= read -r t; do
+            gh api --paginate "orgs/${ORG}/teams/${t}/members" -q '.[].login' 2>/dev/null
+          done < teams.txt | grep -viE "^${AUTHOR}\$" | sort -u > reviewers.txt || true
+
+          # Request the author's team(s) as reviewers.
+          ARGS=(); while IFS= read -r t; do ARGS+=(-f "team_reviewers[]=$t"); done < teams.txt
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/requested_reviewers" \
+            "${ARGS[@]}" \
+            || echo "::warning::Could not auto-request team review (token scope/access). Check still fails."
+
       - name: Comment on HIGH risk
         if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
           {
             echo "🚨 **Automatic escalation: HIGH-risk database migration**"
             echo ""
-            echo "Requesting review from \`@${GITHUB_REPOSITORY%%/*}/${DEVOPS_TEAM}\`. This PR is"
-            echo "blocked by the required \`migration-safety\` check until the risk is resolved or"
-            echo "the DevOps team approves a mitigation plan."
+            if [[ -s teams.txt ]]; then
+              printf 'Requesting review from @%s'"'"'s team(s):' "$AUTHOR"
+              while IFS= read -r t; do printf ' `@%s/%s`' "${GITHUB_REPOSITORY%%/*}" "$t"; done < teams.txt
+              echo ""
+              if [[ -s reviewers.txt ]]; then
+                printf 'Teammates:'
+                while IFS= read -r u; do printf ' @%s' "$u"; done < reviewers.txt
+                echo ""
+              fi
+            else
+              echo "Could not resolve @${AUTHOR}'s team (needs an org repo + read:org token)."
+            fi
+            echo ""
+            echo "This PR is blocked by the required \`migration-safety\` check until the risk"
+            echo "is resolved or a teammate approves a mitigation plan."
             echo ""
             cat migration-report.md
           } > comment.md
           gh pr comment "$PR" --body-file comment.md
-
-      - name: Request DevOps review on HIGH risk
-        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
-        continue-on-error: true   # a bad slug / token scope must not skip the fail step
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          gh api --method POST -H "Accept: application/vnd.github+json" \
-            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/requested_reviewers" \
-            -f "team_reviewers[]=${DEVOPS_TEAM}" \
-            || echo "::warning::Could not auto-request '${DEVOPS_TEAM}' review (check team slug / token scope). Check still fails."
 
       - name: Fail on HIGH risk
         if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
