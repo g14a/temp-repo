@@ -59,14 +59,7 @@ jobs:
           fi
           {
             echo "$MARKER"
-            echo "🚫 **This PR cannot merge into \`master\`.**"
-            echo ""
-            echo "Only release branches (\`release/*\` or \`release-*\`) may target \`master\`."
-            echo "The source branch \`$HEAD_BRANCH\` is not one."
-            echo ""
-            echo "**Please create this PR against a release branch instead of \`master\`.**"
-            echo "Merge your work into a \`release/*\` branch, and let that release branch be"
-            echo "the one that opens a PR to \`master\`."
+            echo "🚫 \`$HEAD_BRANCH\` can't merge into \`master\`. Only \`release/*\` or \`release-*\` branches may. Please open this PR against a release branch instead."
           } > policy_comment.md
           gh pr comment "$PR" --body-file policy_comment.md
 
