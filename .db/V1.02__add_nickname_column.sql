@@ -2,3 +2,5 @@
 ALTER TABLE users ADD COLUMN nickname TEXT;
 
 UPDATE users SET nickname = 'admin' WHERE id = 1;
+
+-- feature tweak
