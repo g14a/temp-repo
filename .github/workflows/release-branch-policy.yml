@@ -1,0 +1,39 @@
+name: Release Branch Policy
+
+# Only release branches may merge into `master`. A PR to `master` from any other
+# source branch fails this required check and stays unmergeable.
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: release-branch-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  release-branch-policy:
+    name: release-branch-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source branch is a release branch
+        env:
+          # Bind the untrusted branch name to an env var; never interpolate a
+          # branch name straight into the shell script body.
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          echo "Source branch: $HEAD_BRANCH"
+
+          if [[ "$HEAD_BRANCH" == release/* || "$HEAD_BRANCH" == release-* ]]; then
+            echo "✅ Release branch — allowed to target master."
+            exit 0
+          fi
+
+          echo "❌ PRs to master must originate from a release/* or release-* branch."
+          echo "   Source '$HEAD_BRANCH' is not a release branch."
+          exit 1

@@ -1,0 +1,129 @@
+name: Migration Safety
+
+# Detects DB migrations that could cause a production CPU/memory/I/O/lock spike.
+# Only inspects `.db/*.sql` files ADDED or MODIFIED by the PR. Analyzer is pure
+# awk (preinstalled on ubuntu-latest) — no Python, no pip, no runtime install.
+# HIGH risk => fails the required `migration-safety` check, requests a DevOps
+# review, and posts an explanatory PR comment. No production database access.
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  pull-requests: write   # post comment + request reviewers
+
+concurrency:
+  group: migration-safety-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # GitHub team (slug only, no org prefix) asked to review on HIGH risk.
+  DEVOPS_TEAM: devops
+
+jobs:
+  migration-safety:
+    name: migration-safety
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — release branches only
+        id: guard
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$HEAD_BRANCH" == release/* || "$HEAD_BRANCH" == release-* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release branch — migration-safety skipped."
+          fi
+
+      - name: Checkout PR
+        if: steps.guard.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Find changed migrations
+        if: steps.guard.outputs.run == 'true'
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" || true
+          git diff --diff-filter=ACMR --name-only "$BASE_SHA" "$HEAD_SHA" -- '.db/' \
+            | grep -Ei '\.sql$' > changed_migrations.txt || true
+          echo "Changed migrations:"; cat changed_migrations.txt || true
+          if [[ -s changed_migrations.txt ]]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Analyze migrations
+        if: steps.guard.outputs.run == 'true' && steps.changed.outputs.any == 'true'
+        id: analyze
+        env:
+          RISK_FILE: risk.txt
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < changed_migrations.txt
+          awk -f .github/scripts/migration_safety.awk "${FILES[@]}" | tee migration-report.md
+          RISK="$(cat risk.txt 2>/dev/null || echo LOW)"
+          echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+          cat migration-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No migrations changed
+        if: steps.guard.outputs.run == 'true' && steps.changed.outputs.any != 'true'
+        run: echo "✅ No .db/*.sql migrations changed by this PR." >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- HIGH-risk escalation: comment FIRST, then request review ----
+      - name: Comment on HIGH risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "🚨 **Automatic escalation: HIGH-risk database migration**"
+            echo ""
+            echo "Requesting review from \`@${GITHUB_REPOSITORY%%/*}/${DEVOPS_TEAM}\`. This PR is"
+            echo "blocked by the required \`migration-safety\` check until the risk is resolved or"
+            echo "the DevOps team approves a mitigation plan."
+            echo ""
+            cat migration-report.md
+          } > comment.md
+          gh pr comment "$PR" --body-file comment.md
+
+      - name: Request DevOps review on HIGH risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
+        continue-on-error: true   # a bad slug / token scope must not skip the fail step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/requested_reviewers" \
+            -f "team_reviewers[]=${DEVOPS_TEAM}" \
+            || echo "::warning::Could not auto-request '${DEVOPS_TEAM}' review (check team slug / token scope). Check still fails."
+
+      - name: Fail on HIGH risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
+        run: |
+          echo "❌ HIGH-risk migration detected — blocking merge."
+          exit 1
+
+      - name: Warn on MEDIUM risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'MEDIUM'
+        run: echo "⚠️ MEDIUM-risk migration — review recommended (not blocking)."
