@@ -22,10 +22,6 @@ concurrency:
   group: migration-safety-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-env:
-  # GitHub team (slug only, no org prefix) asked to review on HIGH risk.
-  DEVOPS_TEAM: devops
-
 jobs:
   migration-safety:
     name: migration-safety
@@ -86,7 +82,37 @@ jobs:
         if: steps.guard.outputs.run == 'true' && steps.changed.outputs.any != 'true'
         run: echo "✅ No .db/*.sql migrations changed by this PR." >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- HIGH-risk escalation: comment FIRST, then request review ----
+      # ---- HIGH-risk escalation: request review from all other collaborators ----
+      - name: Request reviews from other team members on HIGH risk
+        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
+        continue-on-error: true   # a review-request failure must not skip the fail step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          # Everyone with access to the repo, minus the PR author and bots.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/collaborators" \
+            -q '.[].login' \
+            | grep -viE "^${AUTHOR}\$" \
+            | grep -viE '\[bot\]$' \
+            | sort -u > reviewers.txt || true
+
+          if [[ ! -s reviewers.txt ]]; then
+            echo "No other collaborators to request (author is the only member)." | tee reviewers_note.txt
+            exit 0
+          fi
+
+          echo "Requesting review from:"; cat reviewers.txt
+          # Build reviewers[]=<login> args for the API call.
+          ARGS=(); while IFS= read -r u; do ARGS+=(-f "reviewers[]=$u"); done < reviewers.txt
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/requested_reviewers" \
+            "${ARGS[@]}" \
+            || echo "::warning::Could not auto-request one or more reviewers (permissions/access). Check still fails."
+
       - name: Comment on HIGH risk
         if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
         env:
@@ -97,26 +123,20 @@ jobs:
           {
             echo "🚨 **Automatic escalation: HIGH-risk database migration**"
             echo ""
-            echo "Requesting review from \`@${GITHUB_REPOSITORY%%/*}/${DEVOPS_TEAM}\`. This PR is"
-            echo "blocked by the required \`migration-safety\` check until the risk is resolved or"
-            echo "the DevOps team approves a mitigation plan."
+            if [[ -s reviewers.txt ]]; then
+              printf 'Requesting review from all other team members:'
+              while IFS= read -r u; do printf ' @%s' "$u"; done < reviewers.txt
+              echo ""
+            else
+              echo "No other team members available to request a review."
+            fi
+            echo ""
+            echo "This PR is blocked by the required \`migration-safety\` check until the risk"
+            echo "is resolved or a reviewer approves a mitigation plan."
             echo ""
             cat migration-report.md
           } > comment.md
           gh pr comment "$PR" --body-file comment.md
-
-      - name: Request DevOps review on HIGH risk
-        if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
-        continue-on-error: true   # a bad slug / token scope must not skip the fail step
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          gh api --method POST -H "Accept: application/vnd.github+json" \
-            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/requested_reviewers" \
-            -f "team_reviewers[]=${DEVOPS_TEAM}" \
-            || echo "::warning::Could not auto-request '${DEVOPS_TEAM}' review (check team slug / token scope). Check still fails."
 
       - name: Fail on HIGH risk
         if: steps.guard.outputs.run == 'true' && steps.analyze.outputs.risk == 'HIGH'
