@@ -97,17 +97,20 @@ function classify(stmt, U,   tbl, wh, setc, srcs, n, j, agg, colname) {
         if (tbl == "ONLY") tbl = token_after(U, " ON ONLY ")
         gsub(/"/, "", tbl); tbl = tolower(tbl)
         if (is_new_table(tbl)) return   # index on fresh empty table -> LOW
+        # Policy: EVERY index on an existing table is flagged HIGH (blocks),
+        # concurrent or not. Only an index on a table created in the same
+        # migration file (handled above) is exempt.
         if (U ~ /CONCURRENTLY/) {
-            add("MEDIUM", "CREATE INDEX CONCURRENTLY ON " tbl,
-                "Concurrent index build on an existing table — lighter locking, still a long resource-intensive scan.",
+            add("HIGH", "CREATE INDEX CONCURRENTLY ON " tbl,
+                "Concurrent index build on an existing table — lighter locking than a plain build, but still a long, resource-intensive full scan. Policy flags all indexes on existing tables.",
                 "High CPU; High memory; High disk I/O; query latency during build",
-                "Build in a low-traffic window; monitor I/O. Concurrent build already used.")
+                "Requires DevOps review. Run in a low-traffic window and monitor I/O; confirm the table size justifies it.")
             return
         }
         add("HIGH", "CREATE INDEX ON " tbl,
             "Index creation on an existing table takes an ACCESS EXCLUSIVE lock and scans every row.",
             "High CPU; High memory; High disk I/O; blocks writes to the table",
-            "Use CREATE INDEX CONCURRENTLY (outside a transaction) to avoid blocking writes.")
+            "Use CREATE INDEX CONCURRENTLY (outside a transaction) to reduce locking; still requires DevOps review.")
         return
     }
 
